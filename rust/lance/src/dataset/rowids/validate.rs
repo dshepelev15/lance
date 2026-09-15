@@ -221,7 +221,7 @@ mod tests {
         pb::u64_segment::Segment::RangeWithBitmap(pb::u64_segment::RangeWithBitmap {
             start: 0,
             end: 0,
-            bitmap: Vec::new(),
+            bitmap: Vec::new().into(),
         })
     }
 

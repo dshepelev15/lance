@@ -47,7 +47,7 @@ impl PyRowIdSequence {
     #[staticmethod]
     fn from_inline_metadata(metadata: PyRef<'_, PyRowIdMeta>) -> PyResult<Self> {
         match &metadata.0 {
-            RowIdMeta::Inline(data) => read_row_ids(data).infer_error().map(Self),
+            RowIdMeta::Inline(data) => read_row_ids(data.bytes().clone()).infer_error().map(Self),
             RowIdMeta::External(_) => Err(PyNotImplementedError::new_err(
                 "Row ids stored in an external file cannot be read into a RowIdSequence",
             )),

@@ -40,7 +40,7 @@ pub async fn load_row_id_sequence(
 async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => read_row_ids(data),
+        Some(RowIdMeta::Inline(data)) => read_row_ids(data.bytes().clone()),
         Some(RowIdMeta::External(file_slice)) => {
             let path = dataset.base.clone().join(file_slice.path.as_str());
             let range =
@@ -51,7 +51,7 @@ async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<
                 .await?
                 .get_range(range)
                 .await?;
-            read_row_ids(&data)
+            read_row_ids(data)
         }
     }
 }
