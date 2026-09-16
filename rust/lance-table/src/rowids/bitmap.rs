@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use bytes::{Bytes, BytesMut};
 use lance_core::deepsize::DeepSizeOf;
 
 #[derive(PartialEq, Eq, Clone, DeepSizeOf)]
 pub struct Bitmap {
-    pub data: Vec<u8>,
+    /// `Bytes` so a bitmap decoded from a manifest slices the manifest buffer
+    /// instead of copying it: the bitmaps are most of a compacted table's
+    /// row id metadata (~890 MiB of a 945 MiB manifest in one measured table).
+    pub data: Bytes,
     pub len: usize,
 }
 
@@ -41,6 +45,13 @@ impl Bitmap {
     }
 
     pub fn new_full(len: usize) -> Self {
+        Self::new_full_except(len, std::iter::empty())
+    }
+
+    /// A bitmap of `len` set bits with the bits at `cleared` (offsets below
+    /// `len`) cleared. Builds the bytes in one pass, so callers need not
+    /// `clear` bit by bit on the frozen buffer.
+    pub fn new_full_except(len: usize, cleared: impl IntoIterator<Item = usize>) -> Self {
         let mut data = vec![0xff; len.div_ceil(8)];
         // Zero past the end of len
         let remainder = len % 8;
@@ -52,11 +63,17 @@ impl Bitmap {
                 *last_byte &= !(1 << i);
             }
         }
+        for i in cleared {
+            data[i / 8] &= !(1 << (i % 8));
+        }
         Self::from_parts(data, len)
     }
 
-    pub(crate) fn from_parts(data: Vec<u8>, len: usize) -> Self {
-        Self { data, len }
+    pub(crate) fn from_parts(data: impl Into<Bytes>, len: usize) -> Self {
+        Self {
+            data: data.into(),
+            len,
+        }
     }
 
     #[inline]
@@ -64,16 +81,28 @@ impl Bitmap {
         &self.data
     }
 
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
+    pub(crate) fn into_bytes(self) -> Bytes {
         self.data
     }
 
     pub fn set(&mut self, i: usize) {
-        self.data[i / 8] |= 1 << (i % 8);
+        self.modify(|data| data[i / 8] |= 1 << (i % 8));
     }
 
     pub fn clear(&mut self, i: usize) {
-        self.data[i / 8] &= !(1 << (i % 8));
+        self.modify(|data| data[i / 8] &= !(1 << (i % 8)));
+    }
+
+    /// Mutate the bits in place when this bitmap owns its buffer (the common
+    /// case while a segment is being built), copying it first only when the
+    /// buffer is shared with another `Bytes`.
+    fn modify(&mut self, f: impl FnOnce(&mut [u8])) {
+        let mut owned = match std::mem::take(&mut self.data).try_into_mut() {
+            Ok(owned) => owned,
+            Err(shared) => BytesMut::from(shared.as_ref()),
+        };
+        f(&mut owned);
+        self.data = owned.freeze();
     }
 
     pub fn get(&self, i: usize) -> bool {
@@ -110,13 +139,13 @@ impl Bitmap {
 
 impl From<&[bool]> for Bitmap {
     fn from(slice: &[bool]) -> Self {
-        let mut bitmap = Self::new_empty(slice.len());
+        let mut data = vec![0u8; slice.len().div_ceil(8)];
         for (i, &b) in slice.iter().enumerate() {
             if b {
-                bitmap.set(i);
+                data[i / 8] |= 1 << (i % 8);
             }
         }
-        bitmap
+        Self::from_parts(data, slice.len())
     }
 }
 
@@ -172,13 +201,13 @@ impl BitmapSlice<'_> {
 
 impl From<BitmapSlice<'_>> for Bitmap {
     fn from(slice: BitmapSlice) -> Self {
-        let mut bitmap = Self::new_empty(slice.len);
+        let mut data = vec![0u8; slice.len.div_ceil(8)];
         for i in 0..slice.len {
             if slice.bitmap.get(slice.start + i) {
-                bitmap.set(i);
+                data[i / 8] |= 1 << (i % 8);
             }
         }
-        bitmap
+        Self::from_parts(data, slice.len)
     }
 }
 
@@ -228,15 +257,28 @@ mod tests {
     }
 
     #[test]
-    fn test_count_ones_tracks_direct_data_mutation() {
-        let mut bitmap = Bitmap::new_empty(16);
-        assert_eq!(bitmap.count_ones(), 0);
+    fn test_new_full_except_clears_only_the_given_bits() {
+        let bitmap = Bitmap::new_full_except(11, [0, 3, 10]);
+        assert_eq!(bitmap.len(), 11);
+        assert_eq!(bitmap.count_ones(), 8);
+        for i in 0..11 {
+            assert_eq!(bitmap.get(i), ![0, 3, 10].contains(&i), "bit {i}");
+        }
+        // Padding bits past `len` stay zero.
+        assert_eq!(bitmap.bytes()[1] & 0b1111_1000, 0);
+        assert_eq!(Bitmap::new_full_except(11, []), Bitmap::new_full(11));
+    }
 
-        bitmap.data[0] = 0b1010_0101;
+    #[test]
+    fn test_count_ones_tracks_data_mutation() {
+        let mut bitmap = Bitmap::from_parts(vec![0b1010_0101u8, 0], 16);
         assert_eq!(bitmap.count_ones(), 4);
 
-        bitmap.data[1] = 0xff;
+        for i in 8..16 {
+            bitmap.set(i);
+        }
         assert_eq!(bitmap.count_ones(), 12);
+        assert_eq!(bitmap.bytes(), &[0b1010_0101, 0xff]);
     }
 
     #[test]
@@ -358,5 +400,25 @@ mod tests {
             let iter_values: Vec<bool> = bitmap.iter().collect();
             assert_eq!(iter_values, values);
         }
+    }
+
+    #[test]
+    fn test_from_parts_shares_bytes_and_modify_copies_only_when_shared() {
+        let source = Bytes::from(vec![0b0000_1111u8, 0b1111_0000]);
+        let mut bitmap = Bitmap::from_parts(source.clone(), 16);
+        assert_eq!(bitmap.bytes().as_ptr(), source.as_ptr());
+        assert_eq!(bitmap.count_ones(), 8);
+
+        // `source` still holds the buffer, so the first write must copy.
+        bitmap.set(4);
+        assert_ne!(bitmap.bytes().as_ptr(), source.as_ptr());
+        assert_eq!(source[0], 0b0000_1111);
+        assert_eq!(bitmap.bytes()[0], 0b0001_1111);
+
+        // Now uniquely owned: further writes keep the same buffer.
+        let owned_ptr = bitmap.bytes().as_ptr();
+        bitmap.clear(0);
+        assert_eq!(bitmap.bytes().as_ptr(), owned_ptr);
+        assert_eq!(bitmap.bytes()[0], 0b0001_1110);
     }
 }

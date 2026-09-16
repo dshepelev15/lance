@@ -5,6 +5,7 @@ use crate::{format::pb, rowids::bitmap::Bitmap};
 use lance_core::{Error, Result};
 
 use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
+use bytes::Buf;
 use prost::Message;
 
 const ROW_ID_METADATA: &str = "row ID metadata";
@@ -315,7 +316,12 @@ pub fn write_row_ids(sequence: &RowIdSequence) -> Vec<u8> {
 }
 
 /// Deserialize a rowid sequence from some bytes.
-pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
+/// Decode a serialized [`RowIdSequence`].
+///
+/// Pass a `Bytes` (for example the manifest's inline bytes) rather than a
+/// `&[u8]` when possible: bitmap segments then slice the source buffer instead
+/// of copying it.
+pub fn read_row_ids(reader: impl Buf) -> Result<RowIdSequence> {
     let pb_sequence = pb::RowIdSequence::decode(reader).map_err(|error| {
         corrupt_row_id_metadata(format!("failed to decode row ID sequence: {error}"))
     })?;
@@ -353,7 +359,7 @@ mod test {
                 segment: Some(segment),
             }],
         };
-        read_row_ids(&sequence.encode_to_vec())
+        read_row_ids(sequence.encode_to_vec().as_slice())
     }
 
     fn assert_corrupt_segment(segment: pb::u64_segment::Segment, expected_message: &str) {
@@ -380,7 +386,7 @@ mod test {
             segments: vec![segment(), segment()],
         };
 
-        let error = read_row_ids(&sequence.encode_to_vec()).unwrap_err();
+        let error = read_row_ids(sequence.encode_to_vec().as_slice()).unwrap_err();
         assert!(matches!(&error, Error::CorruptFile { .. }));
         assert!(
             error
@@ -416,7 +422,7 @@ mod test {
 
         let serialized = write_row_ids(&sequence);
 
-        let sequence2 = read_row_ids(&serialized).unwrap();
+        let sequence2 = read_row_ids(serialized.as_slice()).unwrap();
 
         assert_eq!(sequence.0, sequence2.0);
     }
@@ -428,7 +434,7 @@ mod test {
         ) {
             let values = values.into_iter().collect::<Vec<_>>();
             let sequence = RowIdSequence::from(values.as_slice());
-            let deserialized = read_row_ids(&write_row_ids(&sequence)).unwrap();
+            let deserialized = read_row_ids(write_row_ids(&sequence).as_slice()).unwrap();
 
             prop_assert_eq!(deserialized.len(), sequence.len());
             prop_assert_eq!(deserialized.iter().collect::<Vec<_>>(), values);
@@ -444,7 +450,7 @@ mod test {
                     pb::u64_segment::RangeWithBitmap {
                         start: 0,
                         end: range_len as u64,
-                        bitmap: vec![0; actual_len],
+                        bitmap: vec![0; actual_len].into(),
                     },
                 );
 
@@ -467,7 +473,7 @@ mod test {
                 pb::u64_segment::RangeWithBitmap {
                     start: 0,
                     end: range_len as u64,
-                    bitmap,
+                    bitmap: bitmap.into(),
                 },
             );
 
@@ -485,7 +491,7 @@ mod test {
                 pb::u64_segment::RangeWithBitmap {
                     start,
                     end: start - 1,
-                    bitmap: Vec::new(),
+                    bitmap: Vec::new().into(),
                 },
             );
 
@@ -634,7 +640,7 @@ mod test {
         pb::u64_segment::RangeWithBitmap {
             start: 10,
             end: 9,
-            bitmap: Vec::new(),
+            bitmap: Vec::new().into(),
         }
     ))]
     fn test_rejects_reversed_range(#[case] segment: pb::u64_segment::Segment) {
@@ -649,7 +655,7 @@ mod test {
             pb::u64_segment::Segment::RangeWithBitmap(pb::u64_segment::RangeWithBitmap {
                 start: 5,
                 end: 14,
-                bitmap,
+                bitmap: bitmap.into(),
             }),
             "does not match expected 2 for range start 5, end 14, and length 9",
         );
@@ -661,7 +667,7 @@ mod test {
             pb::u64_segment::Segment::RangeWithBitmap(pb::u64_segment::RangeWithBitmap {
                 start: 5,
                 end: 14,
-                bitmap: vec![0xff, 0x03],
+                bitmap: vec![0xff, 0x03].into(),
             }),
             "padding bits must be zero",
         );
@@ -689,6 +695,30 @@ mod test {
         assert_corrupt_segment(
             pb::u64_segment::Segment::SortedArray(pb::EncodedU64Array { array: Some(array) }),
             "SortedArray values are not sorted at indices 0 and 1: 2 exceeds 1",
+        );
+    }
+
+    #[test]
+    fn test_read_row_ids_from_bytes_shares_bitmap_buffer() {
+        let mut bitmap = Bitmap::new_full(4096);
+        for hole in (0..4096).step_by(7) {
+            bitmap.clear(hole);
+        }
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 10..4106,
+            bitmap,
+        }]);
+        let encoded = bytes::Bytes::from(write_row_ids(&sequence));
+        let decoded = read_row_ids(encoded.clone()).unwrap();
+        assert_eq!(decoded, sequence);
+        let U64Segment::RangeWithBitmap { bitmap, .. } = &decoded.0[0] else {
+            panic!("expected a bitmap segment");
+        };
+        let start = encoded.as_ptr() as usize;
+        let ptr = bitmap.bytes().as_ptr() as usize;
+        assert!(
+            (start..start + encoded.len()).contains(&ptr),
+            "decoded bitmap must slice the encoded buffer"
         );
     }
 }
