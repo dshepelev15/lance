@@ -122,7 +122,9 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<Manifest> {
         )));
     }
     let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    let mut manifest = Manifest::try_from(proto)?;
+    manifest.detach_sparse_inline_row_ids(recorded_length);
+    Ok(manifest)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
