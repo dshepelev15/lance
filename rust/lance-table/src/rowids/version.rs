@@ -634,7 +634,7 @@ pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
     } else if let Some(row_id_meta) = fragment.row_id_meta.as_ref() {
         match row_id_meta {
             crate::format::RowIdMeta::Inline(data) => {
-                let sequence = read_row_ids(data).unwrap();
+                let sequence = read_row_ids(data.bytes().clone()).unwrap();
                 sequence.len()
             }
             // Follow existing behavior: external sequence not yet supported here
@@ -671,7 +671,7 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
     } else if let Some(row_id_meta) = fragment.row_id_meta.as_ref() {
         match row_id_meta {
             crate::format::RowIdMeta::Inline(data) => {
-                let sequence = read_row_ids(data).unwrap();
+                let sequence = read_row_ids(data.bytes().clone()).unwrap();
                 sequence.len()
             }
             crate::format::RowIdMeta::External(_file) => {

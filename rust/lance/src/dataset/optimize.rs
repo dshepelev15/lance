@@ -2738,7 +2738,9 @@ async fn recalc_versions_for_rewritten_fragments(
     for frag in old_fragments.iter() {
         let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
             match row_id_meta {
-                RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
+                RowIdMeta::Inline(data) => {
+                    lance_table::rowids::read_row_ids(data.bytes().clone())?.len()
+                }
                 RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
             }
         } else {

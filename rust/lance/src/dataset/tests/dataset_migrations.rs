@@ -1004,7 +1004,7 @@ fn test_migration_allocates_from_the_given_mark(
             let RowIdMeta::Inline(data) = f.row_id_meta.as_ref().unwrap() else {
                 panic!("migration writes inline row id meta");
             };
-            read_row_ids(data).unwrap().iter().collect()
+            read_row_ids(data.bytes().clone()).unwrap().iter().collect()
         })
         .collect();
     let expected: Vec<Vec<u64>> = expected.into_iter().map(|r| r.collect()).collect();
