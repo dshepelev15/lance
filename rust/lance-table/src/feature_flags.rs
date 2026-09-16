@@ -67,6 +67,15 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// Row id sequences may contain run-length segments
+/// (`U64Segment.range_with_runs`), which store clustered deletions as runs of
+/// offsets instead of one bit per value. Protobuf readers without the variant
+/// decode such a segment as an unset `oneof` and would report the fragment's
+/// row ids as missing, so a reader must refuse the dataset; a writer that
+/// re-encodes a sequence it cannot decode would drop them, so it must refuse
+/// too. Writers set the bit only when the table has opted into the encoding.
+pub const FLAG_RUN_LENGTH_ROW_ID_SEGMENTS: u64 = 1 << 11;
+const _: () = assert!(FLAG_RUN_LENGTH_ROW_ID_SEGMENTS > FLAG_FRAGMENT_REUSE_INDEX);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -321,6 +330,9 @@ mod tests {
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
         ));
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
+        // Defined by the format spec; this build does not implement the encoding yet.
+        assert!(!can_read_dataset(super::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS));
+        assert!(!can_write_dataset(super::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS));
     }
 
     #[test]

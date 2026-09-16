@@ -59,6 +59,32 @@ message U64Segment {
         bytes bitmap = 3;
     }
 
+    /// A range of u64 values whose missing values form long runs.
+    message RangeWithRuns {
+        /// The start of the range, inclusive.
+        uint64 start = 1;
+        /// The end of the range, exclusive.
+        uint64 end = 2;
+        /* The missing values as maximal runs, in two parallel arrays of offsets
+         * from `start`: `hole_starts[i]` is the first missing offset of run i
+         * and `hole_ends[i]` is the first offset after that run (exclusive).
+         * Both arrays have the same length. Runs are sorted, non-empty, do not
+         * overlap and do not touch (`hole_ends[i] < hole_starts[i + 1]`), so
+         * every run is maximal, and every offset lies in `[0, end - start]`.
+         *
+         * The value `start + o` is present iff no run contains `o`. Its
+         * position in the segment is `o` minus the total length of the runs
+         * that end at or before `o`, so a lookup is a binary search over
+         * `hole_starts` plus a prefix sum of run lengths.
+         *
+         * Compared to `RangeWithBitmap` this costs two offsets per run instead
+         * of one bit per value, so it wins when deletions cluster: a run of
+         * thousands of deleted rows takes 8 bytes rather than hundreds.
+         */
+        EncodedU64Array hole_starts = 3;
+        EncodedU64Array hole_ends = 4;
+    }
+
     oneof segment {
         /// When the values are sorted and contiguous.
         Range range = 1;
@@ -70,6 +96,14 @@ message U64Segment {
         EncodedU64Array sorted_array = 4;
         /// A general array of values, which is not sorted.
         EncodedU64Array array = 5;
+        /* When the values are sorted and the gaps cluster into long runs.
+         *
+         * A manifest that contains this variant must set reader and writer
+         * feature flag `1 << 11` (run-length row id segments): protobuf
+         * readers without this variant decode it as an unset `segment` and
+         * would treat the fragment's row ids as missing or corrupt.
+         */
+        RangeWithRuns range_with_runs = 6;
     }
 } // RowIdSegment
 

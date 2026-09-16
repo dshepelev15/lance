@@ -114,7 +114,7 @@ The sequence is partitioned into segments, each encoded optimally based on the d
 
 #### Segment Encodings
 
-Each segment uses one of five encodings optimized for different data patterns:
+Each segment uses one of six encodings optimized for different data patterns:
 
 ##### Range (Contiguous Values)
 
@@ -157,6 +157,29 @@ Used for fragments with dense deletion patterns.
 
 ```protobuf
 %%% proto.message.RangeWithBitmap %%%
+```
+
+</details>
+
+##### Range with Runs (Clustered Deletions)
+
+For sorted values whose gaps form long runs, as left by compaction of fragments with clustered deletions.
+The missing values are stored as maximal runs in two parallel `EncodedU64Array`s of offsets from `start`: `hole_starts[i]` is the first missing offset of run `i` and `hole_ends[i]` is the first offset after it (exclusive).
+Runs are sorted, non-empty, non-overlapping and non-adjacent, and every offset lies in `[0, end - start]`.
+Example: Row IDs `[100, 101, 105, 106, 107]` → `RangeWithRuns{start: 100, end: 108, hole_starts: [2], hole_ends: [5]}`.
+
+A value `start + o` is present exactly when no run contains `o`; its position in the segment is `o` minus the total length of the runs that end at or before `o`.
+Readers resolve a value with a binary search over `hole_starts` followed by a prefix sum of run lengths, so lookups cost `O(log runs)` rather than a bitmap scan.
+
+Writers must emit this encoding only when the table has opted in, because a manifest that contains it requires reader and writer feature flag `2048` (`FLAG_RUN_LENGTH_ROW_ID_SEGMENTS`, see [Format Versioning](versioning.md)).
+Without that flag an implementation that predates the encoding decodes the segment as an unset `segment` field and would treat the fragment's row IDs as missing.
+A writer that has opted in should prefer this encoding over `RangeWithBitmap` whenever `16 * runs < (end - start) / 8`, that is when two 32-bit offsets per run take fewer bytes than one bit per value.
+
+<details>
+<summary>RangeWithRuns protobuf message</summary>
+
+```protobuf
+%%% proto.message.RangeWithRuns %%%
 ```
 
 </details>

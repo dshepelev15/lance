@@ -134,6 +134,11 @@ message Manifest {
    *   exact versions. Readers and writers must use each DataFile's version
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
+   * * 1 << 11: row id sequences may contain run-length segments
+   *   (U64Segment.range_with_runs). A reader without the encoding decodes such
+   *   a segment as an unset oneof and would report the fragment's row ids as
+   *   missing, so it must refuse the dataset; a writer that re-encodes a
+   *   sequence it cannot decode would drop them, so it must refuse too.
    */
   uint64 reader_feature_flags = 9;
 
