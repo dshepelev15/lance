@@ -56,12 +56,13 @@ fn rewrite_schema(dataset: &Dataset, columns: &[&str]) -> Result<Schema> {
         ));
     }
     let schema = dataset.schema();
-    for column in columns {
-        if !schema.fields.iter().any(|field| &field.name == column) {
-            return Err(Error::invalid_input(format!(
-                "Column \"{column}\" is not a top-level column of the dataset"
-            )));
-        }
+    if let Some(column) = columns
+        .iter()
+        .find(|column| !schema.fields.iter().any(|field| &field.name == *column))
+    {
+        return Err(Error::invalid_input(format!(
+            "Column \"{column}\" is not a top-level column of the dataset"
+        )));
     }
     let ordered = schema
         .fields

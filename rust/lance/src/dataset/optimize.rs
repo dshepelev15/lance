@@ -2778,13 +2778,17 @@ async fn write_column_group_fragments(
         .map(|_| futures::channel::mpsc::channel::<datafusion::error::Result<RecordBatch>>(1))
         .unzip();
 
+    let group_arrow_schemas = projections
+        .iter()
+        .map(|projection| arrow_schema.project(projection).map(Arc::new))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
     // Owns the senders so they drop, and the writers see end-of-stream, as
     // soon as the scan is exhausted.
-    let forward_projections = projections.clone();
     let forward = async move {
         while let Some(batch) = reader.next().await {
             let batch = batch?;
-            for (sender, projection) in senders.iter_mut().zip(&forward_projections) {
+            for (sender, projection) in senders.iter_mut().zip(&projections) {
                 if sender.send(Ok(batch.project(projection)?)).await.is_err() {
                     // That writer failed; its own error is what the join reports.
                     return Ok(());
@@ -2797,14 +2801,13 @@ async fn write_column_group_fragments(
     let writers = receivers
         .into_iter()
         .zip(group_schemas)
-        .zip(&projections)
-        .map(|((receiver, schema), projection)| {
-            let arrow_schema = Arc::new(arrow_schema.project(projection)?);
+        .zip(group_arrow_schemas)
+        .map(|((receiver, schema), arrow_schema)| {
             let stream: SendableRecordBatchStream =
                 Box::pin(RecordBatchStreamAdapter::new(arrow_schema, receiver));
             let params = params.clone();
             let file_row_counts = file_row_counts.clone();
-            Ok(async move {
+            async move {
                 let mut seed_writers =
                     versions::create_seed_writers(write_version, Some(dataset), &params).await?;
                 seed_writers.retain(|writer| schema.field(writer.column_name()).is_some());
@@ -2821,28 +2824,25 @@ async fn write_column_group_fragments(
                     Some(file_row_counts),
                 )
                 .await
-            })
+            }
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     let (_, per_group) = futures::try_join!(forward, futures::future::try_join_all(writers))?;
 
     let mut per_group = per_group.into_iter();
     let mut fragments = per_group.next().unwrap_or_default();
     for group in per_group {
-        if group.len() != fragments.len() {
-            return Err(Error::internal(format!(
-                "column groups wrote {} and {} fragments for the same rows",
-                fragments.len(),
-                group.len()
-            )));
+        let aligned = group.len() == fragments.len()
+            && fragments
+                .iter()
+                .zip(&group)
+                .all(|(fragment, other)| fragment.physical_rows == other.physical_rows);
+        if !aligned {
+            return Err(Error::internal(
+                "column group writers did not split the rows at the same fragments",
+            ));
         }
         for (fragment, other) in fragments.iter_mut().zip(group) {
-            if fragment.physical_rows != other.physical_rows {
-                return Err(Error::internal(format!(
-                    "column groups wrote {:?} and {:?} rows for the same fragment",
-                    fragment.physical_rows, other.physical_rows
-                )));
-            }
             fragment.files.extend(other.files);
         }
     }
