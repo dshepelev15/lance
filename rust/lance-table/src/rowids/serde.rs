@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::{format::pb, rowids::bitmap::Bitmap};
+use crate::{
+    format::pb,
+    rowids::{bitmap::Bitmap, runs::HoleRuns},
+};
 use lance_core::{Error, Result};
 
 use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
@@ -10,7 +13,7 @@ use prost::Message;
 
 const ROW_ID_METADATA: &str = "row ID metadata";
 
-fn corrupt_row_id_metadata(message: impl Into<String>) -> Error {
+pub(super) fn corrupt_row_id_metadata(message: impl Into<String>) -> Error {
     Error::corrupt_file_named(ROW_ID_METADATA, message)
 }
 
@@ -64,6 +67,34 @@ fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64
         })
         .enumerate()
         .find_map(|(index, (previous, next))| (previous >= next).then_some((index, previous, next)))
+}
+
+/// The offsets of a `RangeWithRuns` array as `u32`, rejecting any that do not
+/// fit. Works on the concrete encoding rather than through
+/// `EncodedU64Array::iter`, whose boxed iterator costs a virtual call per
+/// offset; a compacted table decodes tens of millions of them at open.
+fn run_offsets(name: &str, array: EncodedU64Array) -> Result<Vec<u32>> {
+    fn narrow(name: &str, offsets: impl Iterator<Item = u64>) -> Result<Vec<u32>> {
+        offsets
+            .map(|offset| {
+                u32::try_from(offset).map_err(|_| {
+                    corrupt_row_id_metadata(format!(
+                        "RangeWithRuns {name} offset {offset} exceeds u32::MAX"
+                    ))
+                })
+            })
+            .collect()
+    }
+    match array {
+        EncodedU64Array::U32 { base: 0, offsets } => Ok(offsets),
+        EncodedU64Array::U32 { base, offsets } => {
+            narrow(name, offsets.into_iter().map(|o| base + o as u64))
+        }
+        EncodedU64Array::U16 { base, offsets } => {
+            narrow(name, offsets.into_iter().map(|o| base + o as u64))
+        }
+        EncodedU64Array::U64(values) => narrow(name, values.into_iter()),
+    }
 }
 
 impl TryFrom<pb::RowIdSequence> for RowIdSequence {
@@ -126,13 +157,37 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                     holes,
                 })
             }
-            Some(RangeWithRuns(pb_seg::RangeWithRuns { start, end, .. })) => {
-                Err(Error::not_supported_source(
-                    format!(
-                        "run-length row id segment {start}..{end} requires a newer version of Lance"
-                    )
-                    .into(),
-                ))
+            Some(RangeWithRuns(pb_seg::RangeWithRuns {
+                start,
+                end,
+                hole_starts,
+                hole_ends,
+            })) => {
+                let range_len = validate_range("RangeWithRuns", start, end)?;
+                let span = u32::try_from(range_len).map_err(|_| {
+                    corrupt_row_id_metadata(format!(
+                        "RangeWithRuns span {range_len} for start {start} and end {end} exceeds u32::MAX"
+                    ))
+                })?;
+                let decode_offsets = |name: &str, array: Option<pb::EncodedU64Array>| {
+                    let array: EncodedU64Array = array
+                        .ok_or_else(|| {
+                            corrupt_row_id_metadata(format!(
+                                "RangeWithRuns is missing its {name} array"
+                            ))
+                        })?
+                        .try_into()?;
+                    run_offsets(name, array)
+                };
+                let runs = HoleRuns::try_new(
+                    span,
+                    decode_offsets("hole_starts", hole_starts)?,
+                    decode_offsets("hole_ends", hole_ends)?,
+                )?;
+                Ok(Self::RangeWithRuns {
+                    range: start..end,
+                    runs,
+                })
             }
             Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
                 let range_len = validate_range("RangeWithBitmap", start, end)?;
@@ -268,6 +323,19 @@ impl From<U64Segment> for pb::U64Segment {
                     },
                 )),
             },
+            U64Segment::RangeWithRuns { range, runs } => {
+                let offsets = |values: Vec<u64>| Some(EncodedU64Array::from(values).into());
+                Self {
+                    segment: Some(pb::u64_segment::Segment::RangeWithRuns(
+                        pb::u64_segment::RangeWithRuns {
+                            start: range.start,
+                            end: range.end,
+                            hole_starts: offsets(runs.starts().iter().map(|&o| o as u64).collect()),
+                            hole_ends: offsets(runs.ends().map(u64::from).collect()),
+                        },
+                    )),
+                }
+            }
             U64Segment::SortedArray(array) => Self {
                 segment: Some(pb::u64_segment::Segment::SortedArray(array.into())),
             },
@@ -728,5 +796,55 @@ mod test {
             (start..start + encoded.len()).contains(&ptr),
             "decoded bitmap must slice the encoded buffer"
         );
+    }
+
+    #[test]
+    fn test_range_with_runs_round_trip_and_validation() {
+        let runs = HoleRuns::try_new(50, vec![3, 20], vec![10, 45]).unwrap();
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithRuns {
+            range: 100..150,
+            runs,
+        }]);
+        let decoded = read_row_ids(write_row_ids(&sequence).as_slice()).unwrap();
+        assert_eq!(decoded, sequence);
+        assert_eq!(decoded.len(), 50 - 7 - 25);
+
+        use pb::u64_segment::{RangeWithRuns, Segment};
+        let encode = |start: u64, end: u64, starts: Option<Vec<u64>>, ends: Option<Vec<u64>>| {
+            pb::RowIdSequence {
+                segments: vec![pb::U64Segment {
+                    segment: Some(Segment::RangeWithRuns(RangeWithRuns {
+                        start,
+                        end,
+                        hole_starts: starts.map(|s| EncodedU64Array::from(s).into()),
+                        hole_ends: ends.map(|e| EncodedU64Array::from(e).into()),
+                    })),
+                }],
+            }
+            .encode_to_vec()
+        };
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "span over u32",
+                encode(0, 1 << 33, Some(vec![1]), Some(vec![2])),
+            ),
+            ("missing ends", encode(0, 50, Some(vec![1]), None)),
+            (
+                "unsorted",
+                encode(0, 50, Some(vec![20, 3]), Some(vec![25, 10])),
+            ),
+            (
+                "adjacent",
+                encode(0, 50, Some(vec![3, 10]), Some(vec![10, 12])),
+            ),
+            ("beyond span", encode(0, 50, Some(vec![3]), Some(vec![51]))),
+        ];
+        for (name, bytes) in cases {
+            let error = read_row_ids(bytes.as_slice()).unwrap_err();
+            assert!(
+                error.to_string().contains("RangeWithRuns"),
+                "{name}: {error}"
+            );
+        }
     }
 }

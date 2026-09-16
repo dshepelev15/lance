@@ -200,6 +200,7 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
+    supported |= FLAG_RUN_LENGTH_ROW_ID_SEGMENTS;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -329,9 +330,8 @@ mod tests {
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
         ));
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
-        // Defined by the format spec; this build does not implement the encoding yet.
-        assert!(!can_read_dataset(super::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS));
-        assert!(!can_write_dataset(super::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS));
+        assert!(can_read_dataset(super::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS));
+        assert!(can_write_dataset(super::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS));
     }
 
     #[test]
