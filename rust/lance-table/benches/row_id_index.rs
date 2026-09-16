@@ -354,7 +354,7 @@ fn bitmap_segment(start: u64, end: u64, density_pct: u8, seed: u64) -> pb::U64Se
             pb::u64_segment::RangeWithBitmap {
                 start,
                 end,
-                bitmap: data,
+                bitmap: data.into(),
             },
         )),
     }
@@ -490,7 +490,7 @@ fn shot_table_like(
             let bytes = pb::RowIdSequence { segments }.encode_to_vec();
             FragmentRowIdIndex {
                 fragment_id: fragment_id as u32,
-                row_id_sequence: Arc::new(read_row_ids(&bytes).unwrap()),
+                row_id_sequence: Arc::new(read_row_ids(bytes.as_slice()).unwrap()),
                 deletion_vector: Arc::new(DeletionVector::default()),
             }
         })

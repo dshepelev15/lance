@@ -206,11 +206,11 @@ impl U64Segment {
                     Self::RangeWithHoles { range, holes }
                 } else if min_size == &sizes[1] {
                     let range = stats.min..end;
-                    let mut bitmap = Bitmap::new_full((stats.max - stats.min) as usize + 1);
-                    for hole in Self::holes_in_slice(stats.min..=stats.max, sequence) {
-                        let offset = (hole - stats.min) as usize;
-                        bitmap.clear(offset);
-                    }
+                    let bitmap = Bitmap::new_full_except(
+                        (stats.max - stats.min) as usize + 1,
+                        Self::holes_in_slice(stats.min..=stats.max, sequence)
+                            .map(|hole| (hole - stats.min) as usize),
+                    );
                     Self::RangeWithBitmap { range, bitmap }
                 } else {
                     Self::SortedArray(EncodedU64Array::from_iter(sequence))
@@ -860,15 +860,13 @@ mod test {
 
     #[test]
     fn test_range_with_bitmap_data_remains_publicly_mutable() {
-        let mut segment = U64Segment::RangeWithBitmap {
+        let segment = U64Segment::RangeWithBitmap {
             range: 0..8,
-            bitmap: Bitmap::new_empty(8),
+            bitmap: Bitmap::from_parts(vec![0b1010_0101u8], 8),
         };
-        let U64Segment::RangeWithBitmap { bitmap, .. } = &mut segment else {
+        let U64Segment::RangeWithBitmap { bitmap, .. } = &segment else {
             unreachable!();
         };
-
-        bitmap.data[0] = 0b1010_0101;
         assert_eq!(bitmap.len, 8);
         assert_eq!(bitmap.count_ones(), 4);
     }

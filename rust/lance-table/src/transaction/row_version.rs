@@ -65,7 +65,7 @@ pub(super) fn resolve_update_version_metadata(
     let needed_row_ids: HashSet<u64> = new_fragments
         .iter()
         .filter_map(|f| match &f.row_id_meta {
-            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
+            Some(RowIdMeta::Inline(data)) => read_row_ids(data.bytes().clone()).ok(),
             _ => None,
         })
         .flat_map(|seq| seq.iter().collect::<Vec<_>>())
@@ -90,7 +90,7 @@ pub(super) fn resolve_update_version_metadata(
         sorted_frags.sort_by_key(|f| f.id);
         for frag in sorted_frags {
             if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
-                && let Ok(seq) = read_row_ids(data)
+                && let Ok(seq) = read_row_ids(data.bytes().clone())
             {
                 // Range pre-filter: skip the per-row inner loop when the fragment's
                 // bounding row-id range has no overlap with [needed_min, needed_max].
@@ -133,7 +133,7 @@ pub(super) fn resolve_update_version_metadata(
 
     for fragment in new_fragments.iter_mut() {
         let row_ids = match &fragment.row_id_meta {
-            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
+            Some(RowIdMeta::Inline(data)) => read_row_ids(data.bytes().clone()).ok(),
             Some(RowIdMeta::External(_)) => {
                 log::warn!(
                     "Fragment {} has external row ID metadata; \
@@ -227,7 +227,7 @@ impl Transaction {
             if let Some(row_id_meta) = &fragment.row_id_meta {
                 let existing_row_count = match row_id_meta {
                     RowIdMeta::Inline(data) => {
-                        let sequence = read_row_ids(data)?;
+                        let sequence = read_row_ids(data.bytes().clone())?;
                         sequence.len() as u64
                     }
                     _ => 0,
@@ -261,7 +261,7 @@ impl Transaction {
                 let existing_row_count = match &fragment.row_id_meta {
                     Some(RowIdMeta::Inline(data)) => {
                         // Parse the serialized row ID sequence to get the count
-                        let sequence = read_row_ids(data)?;
+                        let sequence = read_row_ids(data.bytes().clone())?;
                         sequence.len() as u64
                     }
                     _ => 0,
@@ -279,7 +279,7 @@ impl Transaction {
 
                         // Merge existing and new row IDs
                         let combined_sequence = match &fragment.row_id_meta {
-                            Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
+                            Some(RowIdMeta::Inline(data)) => read_row_ids(data.bytes().clone())?,
                             _ => {
                                 return Err(Error::internal(
                                     "Failed to deserialize existing row ID sequence",
@@ -348,7 +348,7 @@ mod tests {
         assert!(fragments[0].row_id_meta.is_some());
 
         if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
-            let sequence = read_row_ids(data).unwrap();
+            let sequence = read_row_ids(data.bytes().clone()).unwrap();
             assert_eq!(sequence.len(), 100);
             let row_ids: Vec<u64> = sequence.iter().collect();
             assert_eq!(row_ids, (0..100).collect::<Vec<u64>>());
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(next_row_id, 100);
 
         if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
-            let sequence = read_row_ids(data).unwrap();
+            let sequence = read_row_ids(data.bytes().clone()).unwrap();
             assert_eq!(sequence.len(), 50);
             let row_ids: Vec<u64> = sequence.iter().collect();
             assert_eq!(row_ids, (0..50).collect::<Vec<u64>>());
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(next_row_id, 120);
 
         if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
-            let sequence = read_row_ids(data).unwrap();
+            let sequence = read_row_ids(data.bytes().clone()).unwrap();
             assert_eq!(sequence.len(), 50);
             let row_ids: Vec<u64> = sequence.iter().collect();
             // Should contain original 0-29 plus new 100-119
@@ -491,7 +491,7 @@ mod tests {
 
         // Check first fragment
         if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
-            let sequence = read_row_ids(data).unwrap();
+            let sequence = read_row_ids(data.bytes().clone()).unwrap();
             assert_eq!(sequence.len(), 30);
             let row_ids: Vec<u64> = sequence.iter().collect();
             assert_eq!(row_ids, (1000..1030).collect::<Vec<u64>>());
@@ -501,7 +501,7 @@ mod tests {
 
         // Check second fragment
         if let Some(RowIdMeta::Inline(data)) = &fragments[1].row_id_meta {
-            let sequence = read_row_ids(data).unwrap();
+            let sequence = read_row_ids(data.bytes().clone()).unwrap();
             assert_eq!(sequence.len(), 25);
             let row_ids: Vec<u64> = sequence.iter().collect();
             // Should contain original 500-519 plus new 1030-1034
