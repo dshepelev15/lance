@@ -11,12 +11,13 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_RUN_LENGTH_ROW_ID_SEGMENTS, FLAG_STABLE_ROW_IDS,
+    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
-    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
 use crate::io::{
@@ -24,6 +25,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::rowids::{read_row_ids, write_row_ids};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -50,6 +52,74 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Table config key that opts a table into run-length row id segments
+/// (`U64Segment.range_with_runs`). Set it to `true` with `update_config`.
+///
+/// Manifests written afterwards re-encode bitmap and hole-array segments as
+/// runs where that is smaller and set [`FLAG_RUN_LENGTH_ROW_ID_SEGMENTS`], which
+/// makes the table unreadable to Lance versions that predate the encoding. That
+/// is why it is opt-in rather than the default.
+pub const RUN_LENGTH_ROW_ID_SEGMENTS_CONFIG_KEY: &str = "lance.row_ids.run_length_segments";
+
+fn run_length_row_id_segments_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(RUN_LENGTH_ROW_ID_SEGMENTS_CONFIG_KEY)
+        .is_some_and(|value| str_is_truthy(value))
+}
+
+/// Re-encode inline row id sequences as run-length segments when the table has
+/// opted in, and set the feature flag whenever the manifest contains any.
+///
+/// The flag is sticky: a fragment written under the opt-in keeps its runs until
+/// it is rewritten, so once a manifest carries the flag every later manifest
+/// does too. Fragments that the previous manifest already re-encoded are left
+/// alone (their inline bytes are the very same allocation), so a commit pays
+/// only for the fragments it changed; enabling the key re-encodes every
+/// fragment once.
+fn apply_run_length_row_id_segments(
+    manifest: &mut Manifest,
+    current_manifest: Option<&Manifest>,
+) -> Result<()> {
+    let mut uses_runs = current_manifest
+        .is_some_and(|current| current.reader_feature_flags & FLAG_RUN_LENGTH_ROW_ID_SEGMENTS != 0);
+    if run_length_row_id_segments_enabled(manifest) {
+        let previously_enabled = current_manifest.is_some_and(run_length_row_id_segments_enabled);
+        let unchanged: HashMap<u64, *const u8> = current_manifest
+            .filter(|_| previously_enabled)
+            .map(|current| {
+                current
+                    .fragments
+                    .iter()
+                    .filter_map(|fragment| match &fragment.row_id_meta {
+                        Some(RowIdMeta::Inline(data)) => Some((fragment.id, data.bytes().as_ptr())),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fragments = Arc::make_mut(&mut manifest.fragments);
+        for fragment in fragments.iter_mut() {
+            let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+                continue;
+            };
+            if unchanged.get(&fragment.id) == Some(&data.bytes().as_ptr()) {
+                continue;
+            }
+            let mut sequence = read_row_ids(data.bytes().clone())?;
+            if sequence.use_run_length_segments() {
+                fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+                uses_runs = true;
+            }
+        }
+    }
+    if uses_runs {
+        manifest.reader_feature_flags |= FLAG_RUN_LENGTH_ROW_ID_SEGMENTS;
+        manifest.writer_feature_flags |= FLAG_RUN_LENGTH_ROW_ID_SEGMENTS;
+    }
+    Ok(())
+}
 
 impl Transaction {
     pub(super) fn fragments_with_ids<'a, T>(
@@ -1514,6 +1584,8 @@ impl Transaction {
             }
             _ => {}
         }
+
+        apply_run_length_row_id_segments(&mut manifest, current_manifest)?;
 
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {

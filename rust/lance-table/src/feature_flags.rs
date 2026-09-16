@@ -95,6 +95,11 @@ pub fn apply_feature_flags(
     // immediately before the write.
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
+    // Same carry for run-length row id segments: whether a manifest contains
+    // them is decided by the commit path (re-encoding under the table's
+    // opt-in), not derivable here without decoding every sequence.
+    let run_length_row_ids = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_RUN_LENGTH_ROW_ID_SEGMENTS;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
 
     // Reset flags
@@ -157,6 +162,8 @@ pub fn apply_feature_flags(
 
     manifest.reader_feature_flags |= covered_index_metadata;
     manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= run_length_row_ids;
+    manifest.writer_feature_flags |= run_length_row_ids;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
