@@ -277,7 +277,8 @@ mod test {
     use std::ops::Range;
 
     use crate::dataset::{
-        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+        ProjectionRequest, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+        builder::DatasetBuilder,
     };
 
     use super::*;
@@ -992,6 +993,120 @@ mod test {
 
     pub(super) async fn delete(dataset: &mut Dataset, expr: &str) {
         dataset.delete(expr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_length_row_id_segments_are_opt_in() {
+        use lance_table::feature_flags::FLAG_RUN_LENGTH_ROW_ID_SEGMENTS;
+        use lance_table::transaction::RUN_LENGTH_ROW_ID_SEGMENTS_CONFIG_KEY;
+
+        fn inline_sequences(dataset: &Dataset) -> Vec<RowIdSequence> {
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => read_row_ids(data.bytes().clone()).unwrap(),
+                    other => panic!("expected inline row ids, got {other:?}"),
+                })
+                .collect()
+        }
+        fn has_runs_flag(dataset: &Dataset) -> bool {
+            let manifest = dataset.manifest();
+            manifest.reader_feature_flags & FLAG_RUN_LENGTH_ROW_ID_SEGMENTS != 0
+                && manifest.writer_feature_flags & FLAG_RUN_LENGTH_ROW_ID_SEGMENTS != 0
+        }
+
+        // Deleting a contiguous block inside every fragment leaves each row id
+        // sequence as a range with one long run of holes, which `delete`
+        // encodes as a bitmap segment; compaction carries those segments over.
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(500),
+                Some(WriteParams {
+                    max_rows_per_file: 500,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        delete(&mut dataset, "i % 500 >= 100 and i % 500 < 400").await;
+        compact(&mut dataset, 5000).await;
+        let map_before = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before.len(), 800);
+
+        // Without the opt-in, no run-length segments and no flag.
+        assert!(!has_runs_flag(&dataset));
+        assert!(
+            inline_sequences(&dataset)
+                .iter()
+                .all(|sequence| !sequence.has_run_length_segments())
+        );
+
+        // Opting in re-encodes every eligible fragment in the same commit and
+        // raises the reader and writer flags.
+        dataset
+            .update_config([(RUN_LENGTH_ROW_ID_SEGMENTS_CONFIG_KEY, "true")])
+            .await
+            .unwrap();
+        assert!(has_runs_flag(&dataset));
+        let sequences = inline_sequences(&dataset);
+        assert!(
+            sequences
+                .iter()
+                .any(|sequence| sequence.has_run_length_segments()),
+            "fragments with 300 contiguous holes each should use runs"
+        );
+
+        // Reads see the same row ids; a take by row id resolves through the
+        // run-length index.
+        let map_after = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before, map_after);
+        let mut sample: Vec<u64> = map_before.keys().copied().collect();
+        sample.sort_unstable();
+        let sample: Vec<u64> = sample.into_iter().step_by(97).collect();
+        let taken = dataset
+            .take_rows(
+                &sample,
+                ProjectionRequest::from_columns(["i"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(taken.num_rows(), sample.len());
+        let dataset_arc = Arc::new(dataset.clone());
+        let index = get_row_id_index(&dataset_arc).await.unwrap().unwrap();
+        for (row_id, i) in map_before.iter() {
+            let addr = index.get(*row_id).unwrap().expect("live row id resolves");
+            let _ = (addr, i);
+        }
+
+        // Later commits keep the flag (sticky) and re-encode only what changed.
+        delete(&mut dataset, "i = 10").await;
+        assert!(has_runs_flag(&dataset));
+        // Re-read the manifest from storage: the flag and runs must be on disk,
+        // not only in the in-memory manifest of the writing dataset.
+        let reopened = dataset
+            .checkout_version(dataset.manifest().version)
+            .await
+            .unwrap();
+        assert!(has_runs_flag(&reopened));
+        assert!(
+            inline_sequences(&reopened)
+                .iter()
+                .any(|sequence| sequence.has_run_length_segments())
+        );
+        assert_eq!(scan_rowid_map(&reopened).await.len(), 799);
+
+        // Turning the key off stops new re-encoding but existing runs keep the
+        // flag on: a manifest that contains the variant still needs it.
+        dataset
+            .update_config([(RUN_LENGTH_ROW_ID_SEGMENTS_CONFIG_KEY, "false")])
+            .await
+            .unwrap();
+        assert!(has_runs_flag(&dataset));
     }
 
     #[tokio::test]
