@@ -125,6 +125,14 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                     holes,
                 })
             }
+            Some(RangeWithRuns(pb_seg::RangeWithRuns { start, end, .. })) => {
+                Err(Error::not_supported_source(
+                    format!(
+                        "run-length row id segment {start}..{end} requires a newer version of Lance"
+                    )
+                    .into(),
+                ))
+            }
             Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
                 let range_len = validate_range("RangeWithBitmap", start, end)?;
                 let expected_bitmap_len = range_len.div_ceil(8);
