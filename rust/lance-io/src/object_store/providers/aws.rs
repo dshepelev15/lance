@@ -125,6 +125,7 @@ impl AwsStoreProvider {
         // matches the prefix the registry uses to key this store.
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+        let metrics_base = crate::object_store::metrics_base(&store_prefix, base_path);
 
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
         base_path.set_scheme("s3").unwrap();
@@ -142,7 +143,7 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
 
         Ok(Arc::new(builder.build()?))
     }

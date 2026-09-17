@@ -192,7 +192,10 @@ impl AzureBlobStoreProvider {
 
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            crate::object_store::metrics_base(&store_prefix, base_path),
+        ));
 
         Ok(Arc::new(builder.build()?))
     }
