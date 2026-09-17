@@ -18,8 +18,8 @@ identifies the store; its cardinality is controlled by the
 - `dataset` — `base` as in `full`, plus a `dataset` label carrying the URI the
   store was opened for (`s3://my-bucket/path/table.lance`), so requests can be
   attributed to a dataset. In this mode each URI gets its own object store and
-  HTTP client instead of sharing one per bucket, and cardinality grows with the
-  number of datasets opened.
+  HTTP client instead of sharing one per bucket, while the AIMD throttle budget
+  stays shared per bucket. Cardinality grows with the number of datasets opened.
 - `off` — omit the `base` label entirely.
 
 `operation` is one of `get`, `put`, `put_part`, `head`, `list`, `delete`,

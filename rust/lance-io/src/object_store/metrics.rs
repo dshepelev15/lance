@@ -46,8 +46,8 @@
 //! * `dataset` — `base` as in `full`, plus a `dataset` label with the URI the
 //!   store was opened for, e.g. `s3://bucket/path/table.lance`, so IO can be
 //!   attributed to a dataset. Each URI gets its own store (and HTTP client)
-//!   instead of sharing one per bucket, and cardinality grows with the number
-//!   of datasets opened.
+//!   instead of sharing one per bucket, while the AIMD throttle budget stays
+//!   shared per bucket; cardinality grows with the number of datasets opened.
 //! * `off` — omit the `base` label entirely.
 //!
 //! The metric name constants ([`METRIC_REQUESTS`] etc.) and the recording
