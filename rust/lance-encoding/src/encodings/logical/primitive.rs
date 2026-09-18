@@ -4223,8 +4223,11 @@ struct PendingPageRead {
 ///
 /// The I/O scheduler only coalesces ranges within one request, so pages that
 /// sit next to each other in the file would otherwise cost one request each.
-/// Reads submitted after the flush (indirect reads issued from inside a page's
-/// load future) pass straight through.
+/// A batch is submitted when the job stops scheduling pages or as soon as the
+/// queued reads reach `PAGE_READ_BATCH_BYTES`, so a page that shards its own
+/// reads to bound buffering (blob pages) keeps every shard in a bounded read.
+/// Reads submitted after the final flush (indirect reads issued from inside a
+/// page's load future) pass straight through.
 struct PageReadBatch {
     inner: Arc<dyn EncodingsIo>,
     /// Reads collected so far; `None` once the batch was flushed.
@@ -4245,24 +4248,33 @@ impl PageReadBatch {
         }
     }
 
-    /// Bytes requested by the reads collected so far.
-    fn pending_bytes(&self) -> u64 {
-        self.pending
-            .lock()
-            .unwrap()
+    fn queued_bytes(pending: &[PendingPageRead]) -> u64 {
+        pending
             .iter()
-            .flatten()
             .flat_map(|read| &read.ranges)
             .map(|range| range.end - range.start)
             .sum()
     }
 
-    /// Submits every collected read as one request, sorted by file offset, and
-    /// hands each page its own slice of the result.
+    /// Bytes requested by the reads collected so far.
+    fn pending_bytes(&self) -> u64 {
+        self.pending
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map_or(0, Self::queued_bytes)
+    }
+
+    /// Submits the collected reads and lets later reads pass straight through.
     fn flush(&self) {
-        let Some(pending) = self.pending.lock().unwrap().take() else {
-            return;
-        };
+        if let Some(pending) = self.pending.lock().unwrap().take() {
+            Self::submit_batch(&self.inner, pending);
+        }
+    }
+
+    /// Submits `pending` as one request, sorted by file offset, and hands each
+    /// read its own slice of the result.
+    fn submit_batch(inner: &Arc<dyn EncodingsIo>, pending: Vec<PendingPageRead>) {
         if pending.is_empty() {
             return;
         }
@@ -4291,8 +4303,7 @@ impl PageReadBatch {
         for (position, (_, read_idx, range_idx)) in ordered.iter().enumerate() {
             positions[*read_idx][*range_idx] = position;
         }
-        let batched: SharedPageRead = self
-            .inner
+        let batched: SharedPageRead = inner
             .submit_request(ranges, priority)
             .map(|result| result.map(Arc::new).map_err(CloneableError))
             .boxed()
@@ -4314,6 +4325,15 @@ impl EncodingsIo for PageReadBatch {
         let Some(pending) = pending.as_mut() else {
             return self.inner.submit_request(ranges, priority);
         };
+        // Keep every batch within the budget: a page that shards its reads
+        // must not have all its shards collapse into one unbounded read.
+        let bytes = ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>();
+        if !pending.is_empty() && Self::queued_bytes(pending) + bytes > PAGE_READ_BATCH_BYTES {
+            Self::submit_batch(&self.inner, std::mem::take(pending));
+        }
         let (tx, rx) = oneshot::channel();
         pending.push(PendingPageRead {
             ranges,
@@ -10298,6 +10318,24 @@ mod tests {
         let late = batch.submit_request(vec![400..408], 9).await.unwrap();
         assert_eq!(late[0].as_ref(), &400_u64.to_le_bytes());
         assert_eq!(io.requests.lock().unwrap().len(), 2);
+
+        // Queued reads that would exceed the budget are submitted first, so
+        // no batch grows past it.
+        let io = Arc::new(RecordingScheduler::default());
+        let batch = PageReadBatch::new(io.clone());
+        let budget = super::PAGE_READ_BATCH_BYTES;
+        let first = batch.submit_request(vec![0..budget], 1);
+        assert!(io.requests.lock().unwrap().is_empty());
+        let second = batch.submit_request(vec![budget..(budget + 8)], 2);
+        assert_eq!(
+            io.requests.lock().unwrap().as_slice(),
+            &[vec![0..budget]],
+            "the full batch is submitted before the read that would overflow it"
+        );
+        batch.flush();
+        assert_eq!(io.requests.lock().unwrap().len(), 2);
+        assert_eq!(first.await.unwrap()[0].len(), budget as usize);
+        assert_eq!(second.await.unwrap()[0].as_ref(), &budget.to_le_bytes());
     }
 
     #[tokio::test]
@@ -10310,12 +10348,12 @@ mod tests {
         use crate::EncodingsIo;
         use crate::decoder::{FilterExpression, SchedulerContext, StructuralFieldScheduler};
 
-        /// A page whose only read is `data_range`. The bytes it gets back are
-        /// covered by the batch test, so its load future just fails and the
-        /// test never has to build a decoder.
+        /// A page that reads `data_ranges`, one shard (and one load task) per
+        /// range. The bytes it gets back are covered by the batch test, so its
+        /// load futures just fail and the test never has to build a decoder.
         #[derive(Debug)]
         struct FakeDataPage {
-            data_range: Range<u64>,
+            data_ranges: Vec<Range<u64>>,
         }
 
         impl StructuralPageScheduler for FakeDataPage {
@@ -10348,12 +10386,22 @@ mod tests {
                 use futures::FutureExt;
 
                 let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
-                drop(io.submit_request(vec![self.data_range.clone()], self.data_range.start));
-                Ok(vec![PageLoadTask {
-                    decoder_fut: std::future::ready(Err(lance_core::Error::internal("fake page")))
-                        .boxed(),
-                    num_rows,
-                }])
+                Ok(self
+                    .data_ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(shard, range)| {
+                        drop(io.submit_request(vec![range.clone()], range.start));
+                        PageLoadTask {
+                            decoder_fut: std::future::ready(Err(lance_core::Error::internal(
+                                "fake page",
+                            )))
+                            .boxed(),
+                            // The page's rows are reported once, on the first shard.
+                            num_rows: if shard == 0 { num_rows } else { 0 },
+                        }
+                    })
+                    .collect())
             }
         }
 
@@ -10369,7 +10417,7 @@ mod tests {
                     page_index: page as usize,
                     row_range: (page * 10)..((page + 1) * 10),
                     scheduler: Box::new(FakeDataPage {
-                        data_range: (page * stride)..(page * stride + page_bytes),
+                        data_ranges: vec![(page * stride)..(page * stride + page_bytes)],
                     }),
                 })
                 .collect();
@@ -10420,6 +10468,35 @@ mod tests {
         let second = job.schedule_next(&mut context).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(io.requests.lock().unwrap().len(), 2);
+        assert!(job.schedule_next(&mut context).unwrap().is_empty());
+
+        // A page that shards its own reads (like a blob page) keeps every
+        // shard in a bounded read instead of one request for the whole page.
+        let io = Arc::new(RecordingScheduler::default());
+        let shard = PAGE_READ_BATCH_BYTES;
+        let scheduler = StructuralPrimitiveFieldScheduler::from_page_schedulers(
+            vec![PageInfoAndScheduler {
+                page_index: 0,
+                row_range: 0..10,
+                scheduler: Box::new(FakeDataPage {
+                    data_ranges: vec![0..shard, (2 * shard)..(3 * shard)],
+                }),
+            }],
+            0,
+            Arc::from("test"),
+        );
+        let mut context = SchedulerContext::new(
+            io.clone(),
+            Arc::new(lance_core::cache::LanceCache::no_cache()),
+        );
+        let mut job = scheduler.schedule_ranges(&[0..10], &filter).unwrap();
+        let scan_lines = job.schedule_next(&mut context).unwrap();
+        assert_eq!(scan_lines.len(), 2, "one scan line per shard");
+        assert_eq!(
+            io.requests.lock().unwrap().as_slice(),
+            &[vec![0..shard], vec![(2 * shard)..(3 * shard)]],
+            "each shard stays its own bounded request"
+        );
         assert!(job.schedule_next(&mut context).unwrap().is_empty());
     }
 
