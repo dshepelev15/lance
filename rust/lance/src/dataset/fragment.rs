@@ -1987,7 +1987,7 @@ impl FileFragment {
 
         // Then call take rows
         let batch = self
-            .take_rows(&row_ids, projection, false, false, false, false)
+            .take_rows(&row_ids, projection, FragReadConfig::default())
             .await?;
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
@@ -2176,21 +2176,9 @@ impl FileFragment {
         &self,
         row_offsets: &[u32],
         projection: &Schema,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_created_at_version: bool,
-        with_row_last_updated_at_version: bool,
+        read_config: FragReadConfig,
     ) -> Result<RecordBatch> {
-        let reader = self
-            .open(
-                projection,
-                FragReadConfig::default()
-                    .with_row_id(with_row_id)
-                    .with_row_address(with_row_address)
-                    .with_row_created_at_version(with_row_created_at_version)
-                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
-            )
-            .await?;
+        let reader = self.open(projection, read_config).await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
@@ -6712,10 +6700,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default(),
             )
             .await
             .unwrap();
@@ -6738,10 +6723,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default(),
             )
             .await
             .unwrap();
@@ -6752,7 +6734,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false, false, false)
+            .take_rows(&[], dataset.schema(), FragReadConfig::default())
             .await
             .unwrap();
         assert_eq!(
@@ -6765,10 +6747,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                true,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(true),
             )
             .await
             .unwrap();

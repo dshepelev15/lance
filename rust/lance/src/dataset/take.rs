@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
-use crate::dataset::fragment::FragReadConfig;
+use crate::dataset::fragment::{BaseSchedulers, FragReadConfig};
 use crate::dataset::rowids::get_row_id_index;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
@@ -24,6 +24,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -187,24 +188,29 @@ async fn do_take_rows(
         fragment: FileFragment,
         row_offsets: Vec<u32>,
         projection: Arc<Schema>,
-        with_row_id: bool,
-        with_row_addresses: bool,
-        with_row_created_at_version: bool,
-        with_row_last_updated_at_version: bool,
+        read_config: FragReadConfig,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
-                .take_rows(
-                    &row_offsets,
-                    projection.as_ref(),
-                    with_row_id,
-                    with_row_addresses,
-                    with_row_created_at_version,
-                    with_row_last_updated_at_version,
-                )
+                .take_rows(&row_offsets, projection.as_ref(), read_config)
                 .await
         }
     }
+
+    // One scheduler for the whole take: fragments are opened concurrently, and
+    // a scheduler per fragment would multiply the in-flight I/O and the
+    // backpressure budget by the number of fragments.
+    let object_store = builder.dataset.object_store.clone();
+    let read_config = FragReadConfig::default()
+        .with_row_id(with_row_id_in_projection)
+        .with_row_address(with_row_addr_in_projection)
+        .with_row_created_at_version(with_row_created_at_version_in_projection)
+        .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
+        .with_scan_scheduler(ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        ))
+        .with_base_schedulers(BaseSchedulers::max_bandwidth());
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
     let mut batch = if row_addr_stats.contiguous {
@@ -222,11 +228,6 @@ async fn do_take_rows(
             ))
         })?;
 
-        let read_config = FragReadConfig::default()
-            .with_row_id(with_row_id_in_projection)
-            .with_row_address(with_row_addr_in_projection)
-            .with_row_created_at_version(with_row_created_at_version_in_projection)
-            .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
         let reader = fragment.open(&physical_schema, read_config).await?;
         reader.read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
@@ -269,10 +270,7 @@ async fn do_take_rows(
                 fragment,
                 row_offsets,
                 physical_schema.clone(),
-                with_row_id_in_projection,
-                with_row_addr_in_projection,
-                with_row_created_at_version_in_projection,
-                with_row_last_updated_at_version_in_projection,
+                read_config.clone(),
             );
             batches.push(batch_fut);
         }
@@ -314,10 +312,7 @@ async fn do_take_rows(
                     fragment,
                     indices,
                     physical_schema.clone(),
-                    with_row_id_in_projection,
-                    true,
-                    with_row_created_at_version_in_projection,
-                    with_row_last_updated_at_version_in_projection,
+                    read_config.clone().with_row_address(true),
                 )
             })
             .buffered(builder.dataset.object_store.io_parallelism())
