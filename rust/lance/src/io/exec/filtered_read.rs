@@ -349,12 +349,12 @@ impl FilteredReadGlobalMetrics {
 /// These represent work that is divisible by partition and this work is reported on the
 /// partition that it belongs to
 pub struct FilteredReadPartitionMetrics {
-    // Records the amount of time spent waiting on the lock to grab the next task
-    //
-    // This should typically be fairly small relative to the overall execution time.  If this
-    // value is large then it means we are bottlenecked on the read scheduler which is preventing
-    // this partition from being utilized.
+    /// Time waiting for the next decode task, i.e. for its I/O to be scheduled.
+    /// Large means the scan is I/O bound.
     task_wait_time: Time,
+    /// Wall time of the decode tasks themselves. Tasks run concurrently, so the
+    /// sum can exceed the elapsed time.
+    decode_time: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -362,6 +362,7 @@ impl FilteredReadPartitionMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
+            decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -1418,9 +1419,13 @@ impl FilteredReadStream {
                                 task_stream.lock().await.next().await.transpose()?
                             };
                             Result::Ok(maybe_task.map(|task| {
-                                let decode_time = partition_metrics.decode_time.clone();
+                                let partition_metrics = partition_metrics.clone();
                                 let task = async move {
-                                    let _decode_timer = decode_time.timer();
+                                    let _compute_timer = partition_metrics
+                                        .baseline_metrics
+                                        .elapsed_compute()
+                                        .timer();
+                                    let _decode_timer = partition_metrics.decode_time.timer();
                                     task.await
                                 };
                                 (task, task_stream)
