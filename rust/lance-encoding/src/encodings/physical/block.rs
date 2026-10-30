@@ -767,6 +767,16 @@ fn parallelism<T: ArrowNativeType>(offsets: &[T]) -> usize {
 /// Appends the encoded form of one value to the output buffer.
 type ValueCodec<'a> = dyn Fn(&[u8], &mut Vec<u8>) -> Result<()> + Sync + 'a;
 
+/// Sized like the compute pool so `LANCE_CPU_THREADS` bounds per-value compression
+/// too; rayon's global pool would use every core.
+static CODEC_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(get_num_compute_intensive_cpus())
+        .thread_name(|i| format!("lance-codec-{i}"))
+        .build()
+        .expect("failed to build the per-value codec thread pool")
+});
+
 /// Applies `f` to every value delimited by `offsets`, appending the results to `output`
 /// in value order, and returns the output offsets. With `chunks > 1` the values are
 /// split into that many byte-balanced chunks processed on the rayon pool; the output
@@ -804,19 +814,21 @@ fn map_values<T: ArrowNativeType>(
         }
     }
     bounds.push(offsets.len() - 1);
-    let parts: Vec<Result<(Vec<u8>, Vec<usize>)>> = bounds
-        .par_windows(2)
-        .map(|w| {
-            let (lo, hi) = (w[0], w[1]);
-            let mut out = Vec::new();
-            let mut ends = Vec::with_capacity(hi - lo);
-            for off in offsets[lo..=hi].windows(2) {
-                f(&data[off[0].as_usize()..off[1].as_usize()], &mut out)?;
-                ends.push(out.len());
-            }
-            Ok((out, ends))
-        })
-        .collect();
+    let parts: Vec<Result<(Vec<u8>, Vec<usize>)>> = CODEC_POOL.install(|| {
+        bounds
+            .par_windows(2)
+            .map(|w| {
+                let (lo, hi) = (w[0], w[1]);
+                let mut out = Vec::new();
+                let mut ends = Vec::with_capacity(hi - lo);
+                for off in offsets[lo..=hi].windows(2) {
+                    f(&data[off[0].as_usize()..off[1].as_usize()], &mut out)?;
+                    ends.push(out.len());
+                }
+                Ok((out, ends))
+            })
+            .collect()
+    });
     for part in parts {
         let (out, ends) = part?;
         let base = output.len();
