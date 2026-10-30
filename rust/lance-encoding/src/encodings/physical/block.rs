@@ -164,7 +164,6 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
 #[cfg(feature = "zstd")]
 mod zstd {
     use std::io::{Cursor, Write};
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
 
@@ -177,6 +176,26 @@ mod zstd {
         /// shared pool, so a per-thread context avoids both per-value context
         /// setup and cross-thread lock contention.
         static DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> = const { RefCell::new(None) };
+        /// One compression context per thread, keyed by level, so pages compressed
+        /// on several threads do not serialize on a shared context.
+        static COMPRESSOR: RefCell<Option<(i32, Compressor<'static>)>> = const { RefCell::new(None) };
+    }
+
+    fn compress_frame_into(
+        level: i32,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+    ) -> std::io::Result<usize> {
+        COMPRESSOR.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().map(|(l, _)| *l) != Some(level) {
+                *slot = Some((level, Compressor::new(level)?));
+            }
+            slot.as_mut()
+                .expect("initialized above")
+                .1
+                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
+        })
     }
 
     /// Appends into `buf`'s spare capacity (reserved by the caller) without
@@ -219,7 +238,6 @@ mod zstd {
     /// contention.
     pub struct ZstdBufferCompressor {
         compression_level: i32,
-        compressor: OnceLock<std::result::Result<Mutex<Compressor<'static>>, String>>,
     }
 
     impl std::fmt::Debug for ZstdBufferCompressor {
@@ -232,21 +250,7 @@ mod zstd {
 
     impl ZstdBufferCompressor {
         pub fn new(compression_level: i32) -> Self {
-            Self {
-                compression_level,
-                compressor: OnceLock::new(),
-            }
-        }
-
-        fn get_compressor(&self) -> Result<&Mutex<Compressor<'static>>> {
-            self.compressor
-                .get_or_init(|| {
-                    Compressor::new(self.compression_level)
-                        .map(Mutex::new)
-                        .map_err(|e| e.to_string())
-                })
-                .as_ref()
-                .map_err(|e| Error::internal(format!("Failed to create zstd compressor: {}", e)))
+            Self { compression_level }
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
@@ -327,10 +331,7 @@ mod zstd {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
 
             output_buf.reserve(::zstd::zstd_safe::compress_bound(input_buf.len()));
-            self.get_compressor()?
-                .lock()
-                .unwrap()
-                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
+            compress_frame_into(self.compression_level, input_buf, output_buf)
                 .map_err(|e| Error::internal(format!("Zstd compression error: {}", e)))?;
             Ok(())
         }
