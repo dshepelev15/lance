@@ -979,11 +979,15 @@ pub fn try_variable_width_per_value(
             (PerValueGeneralCompression::ZstdOnly, Some(compression)) => {
                 if compression != "zstd" {
                     // Released 2.1/2.2 readers cannot decode nullable lz4 full-zip pages.
-                    log::warn!(
-                        "field '{}': per-value compression honors only zstd in this file version, ignoring requested '{}'",
-                        field.name,
-                        compression
-                    );
+                    // This runs once per page, so warn once per process.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        log::warn!(
+                            "field '{}': per-value compression honors only zstd in this file version, ignoring requested '{}'",
+                            field.name,
+                            compression
+                        )
+                    });
                 }
                 (compression == "zstd").then_some(CompressionScheme::Zstd)
             }
