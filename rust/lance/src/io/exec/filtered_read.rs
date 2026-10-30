@@ -48,8 +48,8 @@ use lance_core::{
 };
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
-    ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+    DECODE_TIME_METRIC, ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC,
+    RANGES_SCANNED_METRIC, ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
@@ -1413,9 +1413,18 @@ impl FilteredReadStream {
                             // done by spawned background threads.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                            let maybe_task = task_stream.lock().await.next().await.transpose()?;
-                            Result::Ok(maybe_task.map(|task| (task, task_stream)))
+                            let maybe_task = {
+                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                task_stream.lock().await.next().await.transpose()?
+                            };
+                            Result::Ok(maybe_task.map(|task| {
+                                let decode_time = partition_metrics.decode_time.clone();
+                                let task = async move {
+                                    let _decode_timer = decode_time.timer();
+                                    task.await
+                                };
+                                (task, task_stream)
+                            }))
                         }
                     }
                 });
@@ -1487,7 +1496,10 @@ impl FilteredReadStream {
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batches = task.await?;
+                                let batches = {
+                                    let _decode_timer = partition_metrics.decode_time.timer();
+                                    task.await?
+                                };
                                 let batch_rows = batches
                                     .iter()
                                     .map(|batch| batch.batch().num_rows())
