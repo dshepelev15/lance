@@ -1421,10 +1421,6 @@ impl FilteredReadStream {
                             Result::Ok(maybe_task.map(|task| {
                                 let partition_metrics = partition_metrics.clone();
                                 let task = async move {
-                                    let _compute_timer = partition_metrics
-                                        .baseline_metrics
-                                        .elapsed_compute()
-                                        .timer();
                                     let _decode_timer = partition_metrics.decode_time.timer();
                                     task.await
                                 };
